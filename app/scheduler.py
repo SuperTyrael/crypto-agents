@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import async_session_factory
-from app.jobs.fetch_market import fetch_market_data
+from app.datasource.services.datasource import DataSourceService
+from app.core.types import DataSourceType
 
 # 配置日志
 logging.basicConfig(
@@ -25,82 +26,78 @@ class JobScheduler:
     def __init__(self):
         """初始化调度器"""
         self.scheduler = AsyncIOScheduler()
+        self.data_source_service = None
         self._setup_jobs()
+
+    async def _init_data_sources(self):
+        """初始化数据源服务"""
+        try:
+            async with async_session_factory() as session:
+                self.data_source_service = DataSourceService(session)
+                # 注册默认数据源
+                await self.data_source_service.register_default_sources()
+                logger.info("数据源服务初始化成功")
+        except Exception as e:
+            logger.error("数据源服务初始化失败", error=str(e))
+            raise
 
     def _setup_jobs(self):
         """设置定时任务"""
-        # 市场数据获取任务（每分钟）
+        # 新闻数据获取任务
         self.scheduler.add_job(
-            self._fetch_market_job,
-            CronTrigger(minute="*"),
-            id="fetch_market",
-            name="获取市场数据",
+            self._fetch_news_job,
+            CronTrigger(minute=f"*/{settings.BLOCKBEATS_FETCH_INTERVAL // 60}"),
+            id="fetch_news",
+            name="获取新闻数据",
         )
 
-        # 技术指标计算任务（每5分钟）
-        self.scheduler.add_job(
-            self._calc_indicator_job,
-            CronTrigger(minute="*/5"),
-            id="calc_indicator",
-            name="计算技术指标",
-        )
-
-        # LLM分析任务（每小时）
-        self.scheduler.add_job(
-            self._llm_analysis_job,
-            CronTrigger(minute=0),
-            id="llm_analysis",
-            name="LLM市场分析",
-        )
-
-    async def _fetch_market_job(self):
-        """市场数据获取任务"""
+    async def _fetch_news_job(self):
+        """新闻数据获取任务"""
         try:
             async with async_session_factory() as session:
-                await fetch_market_data(session)
+                service = DataSourceService(session)
+                # 获取所有活跃的数据源
+                sources = await service.repository.get_active_sources()
+                for source in sources:
+                    try:
+                        await service.fetch_and_save_news(source.name)
+                        logger.info("新闻数据获取任务完成", source=source.name)
+                    except Exception as e:
+                        logger.error("新闻数据获取任务失败", source=source.name, error=str(e))
         except Exception as e:
-            logger.error("市场数据获取任务失败", error=str(e))
+            logger.error("新闻数据获取任务失败", error=str(e))
 
-    async def _calc_indicator_job(self):
-        """技术指标计算任务"""
-        try:
-            async with async_session_factory() as session:
-                # TODO: 实现技术指标计算
-                pass
-        except Exception as e:
-            logger.error("技术指标计算任务失败", error=str(e))
-
-    async def _llm_analysis_job(self):
-        """LLM分析任务"""
-        try:
-            async with async_session_factory() as session:
-                # TODO: 实现LLM分析
-                pass
-        except Exception as e:
-            logger.error("LLM分析任务失败", error=str(e))
-
-    def start(self):
+    async def start(self):
         """启动调度器"""
-        self.scheduler.start()
-        logger.info("任务调度器已启动")
+        try:
+            await self._init_data_sources()
+            self.scheduler.start()
+            logger.info("任务调度器已启动")
+        except Exception as e:
+            logger.error("调度器启动失败", error=str(e))
+            raise
 
-    def shutdown(self):
+    async def shutdown(self):
         """关闭调度器"""
-        self.scheduler.shutdown()
-        logger.info("任务调度器已关闭")
+        try:
+            self.scheduler.shutdown()
+            logger.info("任务调度器已关闭")
+        except Exception as e:
+            logger.error("调度器关闭失败", error=str(e))
+            raise
 
 
 async def main():
     """主函数"""
     scheduler = JobScheduler()
-    scheduler.start()
+    await scheduler.start()
 
     try:
         # 保持程序运行
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        scheduler.shutdown()
+        await scheduler.shutdown()
 
 
 if __name__ == "__main__":
